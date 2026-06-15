@@ -124,6 +124,15 @@ func getTorrentsBluDV(ctx context.Context, i *Indexer, link, referer string) ([]
 		magnetLink, _ := s.Attr("href")
 		magnetLinks = append(magnetLinks, magnetLink)
 	})
+	textContent.Find("a[href*=\"systemads.net/go.php\"]").Each(func(_ int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		magnetLink, err := getMagnetFromSystemAds(ctx, i, href, link)
+		if err != nil {
+			logging.Warn().Err(err).Str("href", href).Msg("Failed to decode systemads link")
+			return
+		}
+		magnetLinks = append(magnetLinks, magnetLink)
+	})
 
 	adwareDomains := []string{
 		"https://www.seuvideo.xyz",
