@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -31,8 +32,63 @@ const bludvMaxSeasonSearchPages = 3
 var (
 	bludvSeasonEpisodeQueryRE  = regexp.MustCompile(`(?i)\bs0*([0-9]{1,3})[\s._-]*e0*([0-9]{1,3})\b`)
 	bludvTemporadaEpisodeRE    = regexp.MustCompile(`(?i)\btemporada\s+0*([0-9]{1,3})\s+epis.?dio\s+0*([0-9]{1,3})\b`)
+	bludvSeasonOnlyQueryRE     = regexp.MustCompile(`(?i)\bs0*[0-9]{1,3}\b|\be0*[0-9]{1,3}\b|\btemporada\s+0*[0-9]{1,3}\b|\bepis.?dio\s+0*[0-9]{1,3}\b`)
 	bludvSeasonInReleaseNameRE = regexp.MustCompile(`(?i)\b0*([0-9]{1,3})\D{0,6}temporada\b|\btemporada\D{0,6}0*([0-9]{1,3})\b|\bs0*([0-9]{1,3})(?:[\s._-]*e0*[0-9]{1,3})?\b`)
+	bludvNonWordRE             = regexp.MustCompile(`[^a-z0-9]+`)
 )
+
+var bludvComparableTextReplacer = strings.NewReplacer(
+	"&", " and ",
+	"á", "a",
+	"à", "a",
+	"â", "a",
+	"ã", "a",
+	"ä", "a",
+	"é", "e",
+	"è", "e",
+	"ê", "e",
+	"ë", "e",
+	"í", "i",
+	"ì", "i",
+	"î", "i",
+	"ï", "i",
+	"ó", "o",
+	"ò", "o",
+	"ô", "o",
+	"õ", "o",
+	"ö", "o",
+	"ú", "u",
+	"ù", "u",
+	"û", "u",
+	"ü", "u",
+	"ç", "c",
+	"ª", "a",
+	"º", "o",
+)
+
+var bludvIgnoredTitleTokens = map[string]bool{
+	"torrent":   true,
+	"download":  true,
+	"baixar":    true,
+	"web":       true,
+	"dl":        true,
+	"webdl":     true,
+	"webrip":    true,
+	"bluray":    true,
+	"blu":       true,
+	"ray":       true,
+	"brrip":     true,
+	"hdrip":     true,
+	"hdtv":      true,
+	"dual":      true,
+	"audio":     true,
+	"dublado":   true,
+	"legendado": true,
+	"720p":      true,
+	"1080p":     true,
+	"2160p":     true,
+	"4k":        true,
+}
 
 type bludvSearchLink struct {
 	URL   string
@@ -83,7 +139,7 @@ func (i *Indexer) HandlerBluDVIndexer(w http.ResponseWriter, r *http.Request) {
 
 	links := extractBluDVSearchLinks(doc)
 	if requestedSeason != "" && q != "" {
-		links = filterBluDVSearchLinksBySeason(requestedSeason, links)
+		links = filterBluDVSearchLinks(rawQ, requestedSeason, links)
 
 		for pageNum := 2; len(links) == 0 && page == "" && pageNum <= bludvMaxSeasonSearchPages; pageNum++ {
 			nextURL := buildBluDVURL(metadata, q, fmt.Sprintf("%d", pageNum))
@@ -100,7 +156,7 @@ func (i *Indexer) HandlerBluDVIndexer(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			links = filterBluDVSearchLinksBySeason(requestedSeason, extractBluDVSearchLinks(nextDoc))
+			links = filterBluDVSearchLinks(rawQ, requestedSeason, extractBluDVSearchLinks(nextDoc))
 		}
 	}
 	linkURLs := bludvSearchLinkURLs(links)
@@ -162,11 +218,16 @@ func extractBluDVSearchLinks(doc *goquery.Document) []bludvSearchLink {
 	return links
 }
 
-func filterBluDVSearchLinksBySeason(requestedSeason string, links []bludvSearchLink) []bludvSearchLink {
+func filterBluDVSearchLinks(q, requestedSeason string, links []bludvSearchLink) []bludvSearchLink {
 	filtered := make([]bludvSearchLink, 0, len(links))
 	for _, link := range links {
-		season := extractBluDVSeason(fmt.Sprintf("%s %s", link.Title, link.URL))
-		if season == requestedSeason {
+		title := link.Title
+		if title == "" {
+			title = link.URL
+		}
+
+		season := extractBluDVSeason(fmt.Sprintf("%s %s", title, link.URL))
+		if season == requestedSeason && matchesBluDVRequestedTitle(q, title) {
 			filtered = append(filtered, link)
 		}
 	}
@@ -214,8 +275,9 @@ func filterBluDVSeasonResults(q string, torrents []schema.IndexedTorrent) []sche
 
 	filtered := make([]schema.IndexedTorrent, 0, len(torrents))
 	for _, it := range torrents {
-		season := extractBluDVSeason(fmt.Sprintf("%s %s %s", it.Title, it.OriginalTitle, it.Details))
-		if season == requestedSeason {
+		title := fmt.Sprintf("%s %s", it.Title, it.OriginalTitle)
+		season := extractBluDVSeason(fmt.Sprintf("%s %s", title, it.Details))
+		if season == requestedSeason && matchesBluDVRequestedTitle(q, title) {
 			filtered = append(filtered, it)
 		}
 	}
@@ -236,6 +298,66 @@ func extractBluDVSeason(text string) string {
 	}
 
 	return ""
+}
+
+func matchesBluDVRequestedTitle(q, title string) bool {
+	requestedTokens := bludvRequestedTitleTokens(q)
+	if len(requestedTokens) == 0 {
+		return true
+	}
+
+	titleTokens := bludvReleaseTitleTokens(title)
+	if len(titleTokens) != len(requestedTokens) {
+		return false
+	}
+
+	for idx := range requestedTokens {
+		if titleTokens[idx] != requestedTokens[idx] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func bludvRequestedTitleTokens(q string) []string {
+	q = bludvSeasonEpisodeQueryRE.ReplaceAllString(q, " ")
+	q = bludvTemporadaEpisodeRE.ReplaceAllString(q, " ")
+	q = bludvSeasonOnlyQueryRE.ReplaceAllString(q, " ")
+
+	return bludvComparableTokens(q)
+}
+
+func bludvReleaseTitleTokens(title string) []string {
+	normalized := normalizeBluDVComparableText(title)
+	if seasonIndex := bludvSeasonInReleaseNameRE.FindStringIndex(normalized); seasonIndex != nil {
+		normalized = normalized[:seasonIndex[0]]
+	}
+
+	return bludvComparableTokens(normalized)
+}
+
+func bludvComparableTokens(text string) []string {
+	normalized := normalizeBluDVComparableText(text)
+	normalized = bludvNonWordRE.ReplaceAllString(normalized, " ")
+
+	var tokens []string
+	for _, token := range strings.Fields(normalized) {
+		if token == "e" {
+			token = "and"
+		}
+		if bludvIgnoredTitleTokens[token] {
+			continue
+		}
+		tokens = append(tokens, token)
+	}
+
+	return tokens
+}
+
+func normalizeBluDVComparableText(text string) string {
+	text = html.UnescapeString(strings.ToLower(text))
+	return bludvComparableTextReplacer.Replace(text)
 }
 
 func normalizeBluDVSeasonNumber(season string) string {
