@@ -18,6 +18,7 @@ Visit [https://torrent-indexer.darklyn.org/](https://torrent-indexer.darklyn.org
 - [rede-torrent](https://redetorrent.com/)
 - [vaca-torrent](https://vaqueirofilmes.com/)
 - [erai-raws](https://www.erai-raws.info/)
+- [Anime Tosho NEW](https://animetosho.xyz/) (verified Brazilian Portuguese anime subtitles)
 
 ## Deploy
 
@@ -72,6 +73,36 @@ You can configure the server using the following environment variables:
 - `ERAI_RAWS_USERNAME`: (optional) Username for Erai-raws authenticated requests.
 - `ERAI_RAWS_PASSWORD`: (optional) Password for Erai-raws authenticated requests.
 - `ERAI_RAWS_COOKIE`: (optional) Raw Cookie header for Erai-raws, useful when the site requires a browser-authenticated session.
+
+### Anime BR Verified (native Torznab)
+
+The service exposes a native Torznab endpoint at `/api` for anime releases whose Brazilian Portuguese subtitle tracks were independently extracted by Anime Tosho NEW. `[MultiSub]` by itself is never accepted.
+
+Strict mode also checks the actual video filename reported by the torrent processor. A Sonarr search for season 2 episode 10 accepts `S02E10`, but rejects ambiguous payloads such as `S2 - 10`; this prevents the release title and downloaded filename from resolving to different seasons.
+
+Configuration:
+
+- `ANIME_BR_ANIMETOSHO_URL`: JSON feed base URL. Default: `https://feed.animetosho.xyz`.
+- `ANIME_BR_STRICT_FILENAME`: require an actual `SxxEyy` marker in the video filename. Default: `true`; disabling it is not recommended for Sonarr.
+- `ANIME_BR_MAX_DETAILS`: maximum candidate details enriched per search. Default: `48`.
+- `ANIME_BR_DETAIL_CONCURRENCY`: maximum concurrent detail requests. Default: `4`.
+- `ANIME_BR_TIMEOUT_SECONDS`: upstream HTTP timeout. Default: `20`.
+- `ANIME_BR_SEARCH_TIMEOUT_SECONDS`: maximum duration for the complete search. Default: `45`.
+
+In Prowlarr, add a **Generic Torznab** indexer with:
+
+- URL: `http://<torrent-indexer-host>:8080` when using the repository Compose file, or the port published by your deployment (`7006` in the CasaOS example)
+- API Path: `/api`
+- API key: leave empty, or use any placeholder if the UI requires one
+- Categories: TV / Anime (`5070`)
+
+The upstream service can take minutes to process a new torrent. Until it has extracted and identified a Brazilian Portuguese track, strict searches intentionally return no result for that release.
+
+For a local Docker build instead of the published image:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+```
 ## Integrating with Jackett
 
 You can integrate this indexer with Jackett by adding a new Torznab custom indexer. Here is an example of how to do it for the `bludv` indexer:

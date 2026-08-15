@@ -81,12 +81,16 @@ func main() {
 	}
 
 	indexers := handler.NewIndexers(icfg, redis, metrics, req, searchIndex, magnetMetadataAPI)
+	animeBR := handler.NewAnimeBRService(redis)
 	search := handler.NewMeilisearchHandler(searchIndex)
 
 	indexerMux := http.NewServeMux()
 	metricsMux := http.NewServeMux()
 
+	indexerMux.HandleFunc("/api", animeBR.HandlerTorznab)
+	indexerMux.HandleFunc("/api/", animeBR.HandlerTorznab)
 	indexerMux.HandleFunc("/", handler.HandlerIndex)
+	indexerMux.HandleFunc("/indexers/anime_br", animeBR.HandlerJSON)
 	indexerMux.HandleFunc("/indexers/bludv", indexers.HandlerBluDVIndexer)
 	indexerMux.HandleFunc("/indexers/comando_torrents", indexers.HandlerComandoIndexer)
 	indexerMux.HandleFunc("/indexers/rede_torrent", indexers.HandlerRedeTorrentIndexer)

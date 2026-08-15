@@ -1,0 +1,12 @@
+services:
+  torrent-indexer:
+    build:
+      context: .
+    image: torrent-indexer:anime-br-local
+    environment:
+      - ANIME_BR_ANIMETOSHO_URL=https://feed.animetosho.xyz
+      - ANIME_BR_STRICT_FILENAME=true
+      - ANIME_BR_MAX_DETAILS=48
+      - ANIME_BR_DETAIL_CONCURRENCY=4
+      - ANIME_BR_TIMEOUT_SECONDS=20
+      - ANIME_BR_SEARCH_TIMEOUT_SECONDS=45
