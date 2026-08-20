@@ -36,7 +36,10 @@ const (
 	defaultLegacyAnimeToshoTimeout         = 20 * time.Second
 	defaultLegacyAnimeToshoWorkers         = 2
 	maxAnimeBRResponseBytes                = 16 << 20
-	animeBRCacheVersion                    = "v2"
+	// Bump whenever cached upstream payloads gain new interpretation rules.
+	// v3 prevents pre-archive negative/incomplete details from hiding the
+	// historical exact-BTIH fallback after an in-place deployment.
+	animeBRCacheVersion = "v3"
 )
 
 var (

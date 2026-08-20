@@ -304,7 +304,7 @@ func TestAnimeBRDetailResponseUsesAdaptiveCacheTTL(t *testing.T) {
 
 func TestAnimeBRCacheKeyHasVersionedNamespace(t *testing.T) {
 	key := animeBRCacheKey("https://feed.animetosho.xyz/json?show=torrent&id=630216")
-	if !strings.HasPrefix(key, "anime_br:v2:http:") {
+	if !strings.HasPrefix(key, "anime_br:v3:http:") {
 		t.Fatalf("cache key %q does not invalidate the previous namespace", key)
 	}
 }
