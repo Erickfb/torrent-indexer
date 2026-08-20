@@ -115,7 +115,7 @@ func deriveNyaaAliasQuery(items []animeToshoSearchItem, request AnimeBRSearchReq
 	if !(request.SeasonSpecified || request.Season > 0) || request.Episode <= 0 {
 		return ""
 	}
-	requestedBase := normalizeNyaaTitleBase(cleanAnimeBRQuery(request.Query))
+	requestedBase := normalizeNyaaTitleBase(stripTrailingAnimeYear(cleanAnimeBRQuery(request.Query)))
 	type aliasCandidate struct {
 		base  string
 		count int
@@ -331,6 +331,10 @@ func mergeAnimeBRSearchItems(animeToshoItems, nyaaItems []animeToshoSearchItem) 
 			current.Seeders = nyaaItem.Seeders
 			current.Leechers = nyaaItem.Leechers
 			current.NyaaID = nyaaItem.NyaaID
+			// A valid Nyaa RSS item proves the torrent is published even when the
+			// current Anime Tosho summary is a historical "unknown" placeholder.
+			// Final acceptance still requires exact-hash file and subtitle metadata.
+			current.Status = "complete"
 			current.Source = "Nyaa.si + Anime Tosho NEW"
 			itemsByHash[hash] = current
 			continue

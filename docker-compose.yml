@@ -15,6 +15,9 @@ services:
       - FLARESOLVERR_ADDRESS=http://flaresolverr:8191
 
       ## Anime BR verified discovery
+      - ANIME_BR_ANIMETOSHO_LEGACY_ENABLED=true
+      - ANIME_BR_ANIMETOSHO_LEGACY_URL=https://feed.animetosho.org
+      - ANIME_BR_ANIMETOSHO_LEGACY_TIMEOUT_SECONDS=20
       - ANIME_BR_NYAA_ENABLED=true
       - ANIME_BR_NYAA_URL=https://nyaa.si
       - ANIME_BR_NYAA_CACHE_SECONDS=180

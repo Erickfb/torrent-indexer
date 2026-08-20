@@ -25,6 +25,7 @@ import (
 
 const (
 	defaultAnimeToshoURL                   = "https://feed.animetosho.xyz"
+	defaultLegacyAnimeToshoURL             = "https://feed.animetosho.org"
 	defaultNyaaURL                         = "https://nyaa.si"
 	defaultAnimeBRMaxDetails               = 48
 	defaultAnimeBRWorkers                  = 4
@@ -32,6 +33,8 @@ const (
 	defaultNyaaSearchCacheTTL              = 3 * time.Minute
 	defaultNyaaRequestDelay                = 5 * time.Second
 	defaultNyaaDiscoveryTimeout            = 25 * time.Second
+	defaultLegacyAnimeToshoTimeout         = 20 * time.Second
+	defaultLegacyAnimeToshoWorkers         = 2
 	maxAnimeBRResponseBytes                = 16 << 20
 	animeBRCacheVersion                    = "v2"
 )
@@ -41,6 +44,9 @@ var (
 	seasonDashRE      = regexp.MustCompile(`(?i)\bSeason\s*0*(\d{1,3})\b.*?\s-\s*0*(\d{1,5})(?:\D|$)`)
 	bareEpisodeRE     = regexp.MustCompile(`(?i)\s-\s*0*(\d{1,5})(?:v\d+)?(?:\s|\[|\(|$)`)
 	queryEpisodeRE    = regexp.MustCompile(`(?i)\bS0*\d{1,3}E0*\d{1,5}\b`)
+	trailingYearRE    = regexp.MustCompile(`(?i)(?:\s+\((?:19|20)\d{2}\)|\s+\[(?:19|20)\d{2}\]|\s+(?:19|20)\d{2})\s*$`)
+	explicitSeasonRE  = regexp.MustCompile(`(?i)\bS(?:eason)?\s*0*\d{1,3}\b`)
+	bareEpisodeEditRE = regexp.MustCompile(`(?i)(\s-\s*)0*(\d{1,5})(v\d+)?(\s|\[|\(|$)`)
 	brazilianLabelRE  = regexp.MustCompile(`(?i)(brazil|brasil|pt[\s._-]*br|portuguese\s*[\[(]\s*br\s*[\])]|portugu[eê]s\s*[\[(]\s*br(?:asil)?\s*[\])])`)
 	ptBRFileRE        = regexp.MustCompile(`(?i)(?:^|[. _-])(?:pt[._-]?br|por[._-]?br|brazil(?:ian)?)(?:[. _-]|$)`)
 )
@@ -52,6 +58,9 @@ type animeBRCache interface {
 
 type AnimeBRConfig struct {
 	BaseURL                  string
+	LegacyBaseURL            string
+	LegacyEnabled            bool
+	LegacyTimeout            time.Duration
 	NyaaURL                  string
 	NyaaEnabled              bool
 	NyaaSearchCacheTTL       time.Duration
@@ -68,11 +77,12 @@ type AnimeBRConfig struct {
 }
 
 type AnimeBRService struct {
-	config          AnimeBRConfig
-	cache           animeBRCache
-	client          *http.Client
-	nyaaRequestGate chan struct{}
-	nyaaLastRequest time.Time
+	config            AnimeBRConfig
+	cache             animeBRCache
+	client            *http.Client
+	nyaaRequestGate   chan struct{}
+	legacyRequestGate chan struct{}
+	nyaaLastRequest   time.Time
 }
 
 type AnimeBRSearchRequest struct {
@@ -125,25 +135,27 @@ type animeToshoSearchItem struct {
 }
 
 type animeToshoDetail struct {
-	ID          int64                  `json:"id"`
-	Title       string                 `json:"title"`
-	Link        string                 `json:"link"`
-	Timestamp   int64                  `json:"timestamp"`
-	Status      string                 `json:"status"`
-	Deleted     bool                   `json:"deleted"`
-	IsBatch     bool                   `json:"is_batch"`
-	IsDupe      bool                   `json:"is_dupe"`
-	TorrentURL  string                 `json:"torrent_url"`
-	TorrentName string                 `json:"torrent_name"`
-	InfoHash    string                 `json:"info_hash"`
-	MagnetURI   string                 `json:"magnet_uri"`
-	Seeders     int                    `json:"seeders"`
-	Leechers    int                    `json:"leechers"`
-	TotalSize   int64                  `json:"total_size"`
-	TVDBID      int64                  `json:"tvdbid"`
-	TVDBSeason  int                    `json:"tvdb_season"`
-	Attachments []animeToshoAttachment `json:"attachments"`
-	Files       []animeToshoFile       `json:"files"`
+	ID                      int64                  `json:"id"`
+	Title                   string                 `json:"title"`
+	Link                    string                 `json:"link"`
+	Timestamp               int64                  `json:"timestamp"`
+	Status                  string                 `json:"status"`
+	Deleted                 bool                   `json:"deleted"`
+	IsBatch                 bool                   `json:"is_batch"`
+	IsDupe                  bool                   `json:"is_dupe"`
+	TorrentURL              string                 `json:"torrent_url"`
+	TorrentName             string                 `json:"torrent_name"`
+	InfoHash                string                 `json:"info_hash"`
+	MagnetURI               string                 `json:"magnet_uri"`
+	Seeders                 int                    `json:"seeders"`
+	Leechers                int                    `json:"leechers"`
+	TotalSize               int64                  `json:"total_size"`
+	TVDBID                  int64                  `json:"tvdbid"`
+	TVDBSeason              int                    `json:"tvdb_season"`
+	Attachments             []animeToshoAttachment `json:"attachments"`
+	Files                   []animeToshoFile       `json:"files"`
+	LegacyMetadata          bool                   `json:"-"`
+	PrimaryMetadataVerified bool                   `json:"-"`
 }
 
 type animeToshoAttachment struct {
@@ -153,12 +165,31 @@ type animeToshoAttachment struct {
 }
 
 type animeToshoAttachmentInfo struct {
-	Language     string `json:"language"`
-	LanguageCode string `json:"language_code"`
-	Lang         string `json:"lang"`
-	Name         string `json:"name"`
-	Format       string `json:"format"`
-	Forced       bool   `json:"forced"`
+	Language     string              `json:"language"`
+	LanguageCode string              `json:"language_code"`
+	Lang         string              `json:"lang"`
+	Name         string              `json:"name"`
+	Format       string              `json:"format"`
+	Forced       animeBRFlexibleBool `json:"forced"`
+}
+
+// Anime Tosho NEW serializes forced as a JSON boolean, while the historical
+// archive uses 0/1. Accept both representations so old, hash-matched metadata
+// can be decoded without weakening the subtitle policy.
+type animeBRFlexibleBool bool
+
+func (value *animeBRFlexibleBool) UnmarshalJSON(data []byte) error {
+	normalized := strings.ToLower(strings.TrimSpace(string(data)))
+	switch normalized {
+	case "false", "0":
+		*value = false
+		return nil
+	case "true", "1":
+		*value = true
+		return nil
+	default:
+		return fmt.Errorf("invalid flexible boolean %q", string(data))
+	}
 }
 
 type animeToshoFile struct {
@@ -192,6 +223,9 @@ type animeBREvidence struct {
 func NewAnimeBRService(redis *cache.Redis) *AnimeBRService {
 	config := AnimeBRConfig{
 		BaseURL:                  envOrDefault("ANIME_BR_ANIMETOSHO_URL", defaultAnimeToshoURL),
+		LegacyBaseURL:            envOrDefault("ANIME_BR_ANIMETOSHO_LEGACY_URL", defaultLegacyAnimeToshoURL),
+		LegacyEnabled:            !strings.EqualFold(os.Getenv("ANIME_BR_ANIMETOSHO_LEGACY_ENABLED"), "false"),
+		LegacyTimeout:            time.Duration(envIntOrDefault("ANIME_BR_ANIMETOSHO_LEGACY_TIMEOUT_SECONDS", int(defaultLegacyAnimeToshoTimeout/time.Second))) * time.Second,
 		NyaaURL:                  envOrDefault("ANIME_BR_NYAA_URL", defaultNyaaURL),
 		NyaaEnabled:              !strings.EqualFold(os.Getenv("ANIME_BR_NYAA_ENABLED"), "false"),
 		NyaaSearchCacheTTL:       time.Duration(envIntOrDefault("ANIME_BR_NYAA_CACHE_SECONDS", int(defaultNyaaSearchCacheTTL/time.Second))) * time.Second,
@@ -212,6 +246,7 @@ func NewAnimeBRService(redis *cache.Redis) *AnimeBRService {
 
 func newAnimeBRService(config AnimeBRConfig, c animeBRCache, client *http.Client) *AnimeBRService {
 	config.BaseURL = strings.TrimRight(config.BaseURL, "/")
+	config.LegacyBaseURL = strings.TrimRight(config.LegacyBaseURL, "/")
 	config.NyaaURL = strings.TrimRight(config.NyaaURL, "/")
 	if config.MaxDetails <= 0 {
 		config.MaxDetails = defaultAnimeBRMaxDetails
@@ -248,14 +283,23 @@ func newAnimeBRService(config AnimeBRConfig, c animeBRCache, client *http.Client
 			config.NyaaDiscoveryTimeout = defaultNyaaDiscoveryTimeout
 		}
 	}
+	if config.LegacyEnabled {
+		if config.LegacyBaseURL == "" {
+			config.LegacyBaseURL = defaultLegacyAnimeToshoURL
+		}
+		if config.LegacyTimeout <= 0 {
+			config.LegacyTimeout = defaultLegacyAnimeToshoTimeout
+		}
+	}
 	if client == nil {
 		client = &http.Client{Timeout: config.RequestTimeout}
 	}
 	return &AnimeBRService{
-		config:          config,
-		cache:           c,
-		client:          client,
-		nyaaRequestGate: make(chan struct{}, 1),
+		config:            config,
+		cache:             c,
+		client:            client,
+		nyaaRequestGate:   make(chan struct{}, 1),
+		legacyRequestGate: make(chan struct{}, defaultLegacyAnimeToshoWorkers),
 	}
 }
 
@@ -270,7 +314,7 @@ func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchReques
 
 	candidates := make([]animeToshoSearchItem, 0, len(items))
 	for _, item := range items {
-		if !strings.EqualFold(item.Status, "complete") || !validInfoHash(item.InfoHash) {
+		if (!strings.EqualFold(item.Status, "complete") && !strings.Contains(item.Source, "Nyaa.si")) || !validInfoHash(item.InfoHash) {
 			continue
 		}
 		if !candidateCouldMatchEpisode(item.Title+" "+item.TorrentName, request) {
@@ -280,6 +324,13 @@ func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchReques
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
+		if s.config.LegacyEnabled {
+			iArchivePriority := animeBRArchiveCandidatePriority(candidates[i])
+			jArchivePriority := animeBRArchiveCandidatePriority(candidates[j])
+			if iArchivePriority != jArchivePriority {
+				return iArchivePriority > jArchivePriority
+			}
+		}
 		iScore := animeBRQualityScore(candidates[i].Title, candidates[i].Seeders)
 		jScore := animeBRQualityScore(candidates[j].Title, candidates[j].Seeders)
 		if iScore == jScore {
@@ -290,6 +341,26 @@ func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchReques
 	if len(candidates) > s.config.MaxDetails {
 		candidates = candidates[:s.config.MaxDetails]
 	}
+
+	// The archive is an optional historical enricher. Every candidate shares one
+	// small budget, so a slow legacy host can never multiply its timeout by the
+	// number of workers or consume the entire search deadline.
+	legacyCtx := ctx
+	cancelLegacy := func() {}
+	if s.config.LegacyEnabled {
+		legacyBudget := s.config.LegacyTimeout
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline) - 5*time.Second
+			legacyBudget = min(legacyBudget, remaining)
+		}
+		if legacyBudget > 0 {
+			legacyCtx, cancelLegacy = context.WithTimeout(ctx, legacyBudget)
+		} else {
+			legacyCtx, cancelLegacy = context.WithCancel(ctx)
+			cancelLegacy()
+		}
+	}
+	defer cancelLegacy()
 
 	type detailResult struct {
 		release *AnimeBRRelease
@@ -304,7 +375,7 @@ func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchReques
 		go func() {
 			defer wg.Done()
 			for item := range jobs {
-				detail, detailErr := s.getAnimeToshoDetailForCandidate(ctx, item)
+				detail, detailErr := s.getAnimeToshoDetailForCandidate(ctx, legacyCtx, item)
 				if detailErr != nil {
 					results <- detailResult{err: detailErr}
 					continue
@@ -466,7 +537,7 @@ func (s *AnimeBRService) searchAnimeToshoForRequest(ctx context.Context, request
 
 func animeBRSearchQueries(request AnimeBRSearchRequest) []string {
 	base := cleanAnimeBRQuery(request.Query)
-	queries := make([]string, 0, 3)
+	queries := make([]string, 0, 4)
 	add := func(query string) {
 		query = strings.Join(strings.Fields(query), " ")
 		if !slices.Contains(queries, query) {
@@ -474,6 +545,22 @@ func animeBRSearchQueries(request AnimeBRSearchRequest) []string {
 		}
 	}
 	hasSeason := request.SeasonSpecified || request.Season > 0
+	yearless := stripTrailingAnimeYear(base)
+	if yearless != "" && yearless != base {
+		// Keep at most four variants. Nyaa enforces a five-second crawl delay, so
+		// extra year-qualified broad searches would crowd out the useful yearless
+		// episode queries within the discovery budget.
+		if hasSeason && request.Episode > 0 {
+			add(fmt.Sprintf("%s S%02dE%02d", yearless, request.Season, request.Episode))
+			add(fmt.Sprintf("%s S%02dE%02d", base, request.Season, request.Episode))
+			add(fmt.Sprintf("%s %02d", yearless, request.Episode))
+		} else if hasSeason {
+			add(fmt.Sprintf("%s S%02d", base, request.Season))
+			add(fmt.Sprintf("%s S%02d", yearless, request.Season))
+		}
+		add(yearless)
+		return queries
+	}
 	if hasSeason && request.Episode > 0 {
 		add(fmt.Sprintf("%s S%02dE%02d", base, request.Season, request.Episode))
 		add(fmt.Sprintf("%s %02d", base, request.Episode))
@@ -482,6 +569,10 @@ func animeBRSearchQueries(request AnimeBRSearchRequest) []string {
 	}
 	add(base)
 	return queries
+}
+
+func stripTrailingAnimeYear(query string) string {
+	return strings.TrimSpace(trailingYearRE.ReplaceAllString(query, ""))
 }
 
 func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail animeToshoDetail, request AnimeBRSearchRequest) (AnimeBRRelease, bool) {
@@ -503,6 +594,11 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 	}
 
 	matchingFile, ok := selectCompatibleVideoFile(detail.Files, request, s.config.StrictFilename)
+	normalizedBareEpisode := false
+	if !ok && detail.LegacyMetadata {
+		matchingFile, ok = selectSafeSeasonOneBareVideoFile(detail, request)
+		normalizedBareEpisode = ok
+	}
 	if !ok {
 		return AnimeBRRelease{}, false
 	}
@@ -517,6 +613,11 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 	}
 	if title == "" {
 		title = strings.TrimSpace(detail.Title)
+	}
+	if normalizedBareEpisode {
+		title = normalizeBareEpisodeTitle(title, request.Season, request.Episode)
+		evidence.Reasons = append(evidence.Reasons,
+			"season-one bare episode normalized after exact infohash, TVDB season, file, and PT-BR verification")
 	}
 	if !strings.Contains(strings.ToLower(title), "[brazilian]") {
 		title += " [Brazilian]"
@@ -536,6 +637,18 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 		detailsURL = firstNonEmpty(item.Link, detail.Link, nyaaDetailsFallback)
 		source = "Nyaa.si + Anime Tosho NEW"
 		evidence.Reasons = append(evidence.Reasons, "Nyaa.si candidate matched Anime Tosho metadata by exact infohash")
+	}
+	if detail.LegacyMetadata {
+		if strings.Contains(source, "Nyaa.si") {
+			if detail.PrimaryMetadataVerified {
+				source = "Nyaa.si + Anime Tosho NEW + Anime Tosho archive"
+			} else {
+				source = "Nyaa.si + Anime Tosho archive"
+			}
+		} else {
+			source = "Anime Tosho NEW + Anime Tosho archive"
+		}
+		evidence.Reasons = append(evidence.Reasons, "historical file and subtitle metadata matched by exact infohash")
 	}
 	if downloadURL == "" {
 		return AnimeBRRelease{}, false
@@ -622,18 +735,57 @@ func (s *AnimeBRService) getAnimeToshoDetail(ctx context.Context, id int64) (ani
 	return detail, nil
 }
 
-func (s *AnimeBRService) getAnimeToshoDetailForCandidate(ctx context.Context, item animeToshoSearchItem) (animeToshoDetail, error) {
+func (s *AnimeBRService) getAnimeToshoDetailForCandidate(ctx, legacyCtx context.Context, item animeToshoSearchItem) (animeToshoDetail, error) {
+	var (
+		detail animeToshoDetail
+		err    error
+	)
 	if item.ID > 0 {
-		return s.getAnimeToshoDetail(ctx, item.ID)
+		detail, err = s.getAnimeToshoDetail(ctx, item.ID)
+	} else {
+		if !validInfoHash(item.InfoHash) {
+			return animeToshoDetail{}, fmt.Errorf("candidate has no valid Anime Tosho id or infohash")
+		}
+		detail, err = s.getAnimeToshoDetailByHash(ctx, item.InfoHash)
 	}
-	if !validInfoHash(item.InfoHash) {
-		return animeToshoDetail{}, fmt.Errorf("candidate has no valid Anime Tosho id or infohash")
+	if err != nil {
+		return animeToshoDetail{}, err
 	}
-	return s.getAnimeToshoDetailByHash(ctx, item.InfoHash)
+	detail.PrimaryMetadataVerified = animeBRPrimaryMetadataVerified(detail, item.InfoHash)
+	if !s.config.LegacyEnabled || legacyCtx == nil || !animeBRDetailNeedsLegacyMetadata(detail, item) {
+		return detail, nil
+	}
+
+	legacy, legacyErr := s.getLegacyAnimeToshoDetailByHash(legacyCtx, item.InfoHash)
+	if legacyErr != nil {
+		// Historical enrichment is deliberately fail-open: a slow, unavailable,
+		// or malformed archive must not break modern Anime Tosho results.
+		logging.Debug().Err(legacyErr).Str("infohash", strings.ToLower(item.InfoHash)).Msg("Anime Tosho archive enrichment failed")
+		return detail, nil
+	}
+	merged, ok := mergeLegacyAnimeToshoMetadata(detail, legacy, item.InfoHash)
+	if !ok {
+		return detail, nil
+	}
+	return merged, nil
 }
 
 func (s *AnimeBRService) getAnimeToshoDetailByHash(ctx context.Context, infoHash string) (animeToshoDetail, error) {
-	endpoint, err := url.Parse(s.config.BaseURL + "/json")
+	return s.getAnimeToshoDetailByHashFrom(ctx, s.config.BaseURL, infoHash)
+}
+
+func (s *AnimeBRService) getLegacyAnimeToshoDetailByHash(ctx context.Context, infoHash string) (animeToshoDetail, error) {
+	select {
+	case s.legacyRequestGate <- struct{}{}:
+		defer func() { <-s.legacyRequestGate }()
+	case <-ctx.Done():
+		return animeToshoDetail{}, ctx.Err()
+	}
+	return s.getAnimeToshoDetailByHashFrom(ctx, s.config.LegacyBaseURL, infoHash)
+}
+
+func (s *AnimeBRService) getAnimeToshoDetailByHashFrom(ctx context.Context, baseURL, infoHash string) (animeToshoDetail, error) {
+	endpoint, err := url.Parse(baseURL + "/json")
 	if err != nil {
 		return animeToshoDetail{}, err
 	}
@@ -658,6 +810,65 @@ func (s *AnimeBRService) getAnimeToshoDetailByHash(ctx context.Context, infoHash
 		return animeToshoDetail{}, fmt.Errorf("Anime Tosho detail for %s failed: %w", infoHash, err)
 	}
 	return detail, nil
+}
+
+func animeBRDetailNeedsLegacyMetadata(detail animeToshoDetail, item animeToshoSearchItem) bool {
+	detailHash := strings.ToLower(strings.TrimSpace(detail.InfoHash))
+	expectedHash := strings.ToLower(strings.TrimSpace(item.InfoHash))
+	if !validInfoHash(expectedHash) || detail.Deleted || detail.IsDupe || detail.IsBatch {
+		return false
+	}
+	if detailHash != "" && (!validInfoHash(detailHash) || detailHash != expectedHash) {
+		return false
+	}
+	if animeBRDetailHasProcessedVideo(detail) {
+		return false
+	}
+	return strings.EqualFold(detail.Status, "complete") || strings.Contains(item.Source, "Nyaa.si")
+}
+
+func animeBRPrimaryMetadataVerified(detail animeToshoDetail, expectedHash string) bool {
+	detailHash := strings.ToLower(strings.TrimSpace(detail.InfoHash))
+	expectedHash = strings.ToLower(strings.TrimSpace(expectedHash))
+	return validInfoHash(expectedHash) && detailHash == expectedHash &&
+		strings.EqualFold(detail.Status, "complete") && !detail.Deleted && !detail.IsDupe && !detail.IsBatch
+}
+
+func animeBRDetailHasProcessedVideo(detail animeToshoDetail) bool {
+	for _, file := range detail.Files {
+		if file.Processed && isVideoFileName(file.Filename) {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeLegacyAnimeToshoMetadata(primary, legacy animeToshoDetail, expectedHash string) (animeToshoDetail, bool) {
+	expectedHash = strings.ToLower(strings.TrimSpace(expectedHash))
+	primaryHash := strings.ToLower(strings.TrimSpace(primary.InfoHash))
+	legacyHash := strings.ToLower(strings.TrimSpace(legacy.InfoHash))
+	if !validInfoHash(expectedHash) || (primaryHash != "" && primaryHash != expectedHash) || legacyHash != expectedHash ||
+		primary.Deleted || primary.IsDupe || primary.IsBatch ||
+		!strings.EqualFold(legacy.Status, "complete") || legacy.Deleted || legacy.IsDupe || legacy.IsBatch ||
+		!animeBRDetailHasProcessedVideo(legacy) {
+		return primary, false
+	}
+
+	merged := primary
+	// IDs from the two deployments are unrelated and may collide. Only immutable
+	// file/subtitle metadata crosses the boundary after exact BTIH validation.
+	merged.Files = legacy.Files
+	if merged.InfoHash == "" {
+		merged.InfoHash = expectedHash
+	}
+	if !strings.EqualFold(merged.Status, "complete") {
+		merged.Status = legacy.Status
+	}
+	if len(merged.Attachments) == 0 {
+		merged.Attachments = legacy.Attachments
+	}
+	merged.LegacyMetadata = true
+	return merged, true
 }
 
 type animeBRHTTPStatusError struct {
@@ -763,7 +974,7 @@ func classifyPTBREvidence(detail animeToshoDetail, selectedFile animeToshoFile) 
 		if isBrazilian {
 			hasBrazilianAttachment = true
 		}
-		if attachment.Info.Forced || isForcedSubtitleLabel(label) {
+		if bool(attachment.Info.Forced) || isForcedSubtitleLabel(label) {
 			continue
 		}
 		if isBrazilian {
@@ -853,6 +1064,45 @@ func selectCompatibleVideoFile(files []animeToshoFile, request AnimeBRSearchRequ
 	return animeToshoFile{}, false
 }
 
+func selectSafeSeasonOneBareVideoFile(detail animeToshoDetail, request AnimeBRSearchRequest) (animeToshoFile, bool) {
+	if !request.SeasonSpecified || request.Season != 1 || request.Episode <= 0 ||
+		!detail.PrimaryMetadataVerified || detail.TVDBSeason != 1 || detail.TVDBID <= 0 ||
+		(request.TVDBID > 0 && request.TVDBID != detail.TVDBID) {
+		return animeToshoFile{}, false
+	}
+
+	videoFiles := make([]animeToshoFile, 0, 1)
+	for _, file := range detail.Files {
+		if isVideoFileName(file.Filename) {
+			videoFiles = append(videoFiles, file)
+		}
+	}
+	if len(videoFiles) != 1 || !videoFiles[0].Processed {
+		return animeToshoFile{}, false
+	}
+	file := videoFiles[0]
+	if standardEpisodeRE.MatchString(file.Filename) || explicitSeasonRE.MatchString(file.Filename) {
+		return animeToshoFile{}, false
+	}
+	matches := bareEpisodeRE.FindAllStringSubmatch(file.Filename, -1)
+	if len(matches) != 1 || len(matches[0]) != 2 {
+		return animeToshoFile{}, false
+	}
+	episode, err := strconv.Atoi(matches[0][1])
+	if err != nil || episode != request.Episode {
+		return animeToshoFile{}, false
+	}
+	return file, true
+}
+
+func normalizeBareEpisodeTitle(title string, season, episode int) string {
+	if season != 1 || episode <= 0 {
+		return title
+	}
+	replacement := fmt.Sprintf(" S%02dE%02d${3}${4}", season, episode)
+	return bareEpisodeEditRE.ReplaceAllString(title, replacement)
+}
+
 func episodeFromFilename(filename string) (int, int, bool) {
 	match := standardEpisodeRE.FindStringSubmatch(filename)
 	if len(match) != 3 {
@@ -925,6 +1175,24 @@ func animeBRQualityScore(title string, seeders int) int {
 		score += 40
 	}
 	return score
+}
+
+// Historical enrichment is bounded by one shared deadline. Signals in a title
+// never count as language proof, but they are useful for deciding which exact
+// hashes to verify first when an old query yields many incomplete records.
+func animeBRArchiveCandidatePriority(item animeToshoSearchItem) int {
+	lower := strings.ToLower(item.Title + " " + item.TorrentName)
+	priority := 0
+	if strings.Contains(lower, "pt-br") || strings.Contains(lower, "ptbr") || strings.Contains(lower, "brazilian") || strings.Contains(lower, "brasil") {
+		priority += 400
+	}
+	if strings.Contains(lower, "multisub") || strings.Contains(lower, "multiple subtitle") || strings.Contains(lower, "multi-sub") {
+		priority += 200
+	}
+	if strings.Contains(lower, "erai-raws") {
+		priority += 100
+	}
+	return priority
 }
 
 func isVideoFileName(name string) bool {

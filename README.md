@@ -20,6 +20,7 @@ Visit [https://torrent-indexer.darklyn.org/](https://torrent-indexer.darklyn.org
 - [erai-raws](https://www.erai-raws.info/)
 - [Nyaa.si](https://nyaa.si/) (anime torrent discovery)
 - [Anime Tosho NEW](https://animetosho.xyz/) (Brazilian Portuguese subtitle verification)
+- [Anime Tosho legacy feed](https://feed.animetosho.org/) (historical file and subtitle metadata fallback)
 
 ## Deploy
 
@@ -77,15 +78,20 @@ You can configure the server using the following environment variables:
 
 ### Anime BR Verified (native Torznab)
 
-The service exposes a native Torznab endpoint at `/api`. It discovers anime candidates concurrently through Anime Tosho NEW and the Nyaa.si RSS feed, merges them by BitTorrent info hash, and only returns releases whose Brazilian Portuguese subtitle tracks were independently extracted by Anime Tosho NEW. `[MultiSub]` by itself is never accepted.
+The service exposes a native Torznab endpoint at `/api`. It discovers anime candidates concurrently through Anime Tosho NEW and the Nyaa.si RSS feed, merges them by BitTorrent info hash, and only returns releases whose Brazilian Portuguese subtitle tracks were independently extracted by Anime Tosho. `[MultiSub]` by itself is never accepted.
 
 Nyaa.si is a discovery source, not the source of PT-BR proof. A torrent found only on Nyaa is looked up by its exact info hash in Anime Tosho NEW. If it has not been processed there yet, it is intentionally withheld and retried after the short unverified-result cache expires.
 
-Strict mode also checks the actual video filename reported by the torrent processor. A Sonarr search for season 2 episode 10 accepts `S02E10`, but rejects ambiguous payloads such as `S2 - 10`; this prevents the release title and downloaded filename from resolving to different seasons.
+For older releases whose file metadata is no longer present in Anime Tosho NEW, the service can consult the legacy Anime Tosho feed. This is a fallback-only metadata lookup using the exact BitTorrent info hash (BTIH); legacy IDs are never trusted or matched because they can collide with current IDs. A legacy timeout, malformed response, missing record, or hash mismatch is ignored, so current searches continue with Anime Tosho NEW results.
+
+Strict mode also checks the actual video filename reported by the torrent processor. A Sonarr search for season 2 episode 10 accepts `S02E10`, but rejects ambiguous payloads such as `S2 - 10`; this prevents the release title and downloaded filename from resolving to different seasons. A historical season-one filename using bare numbering, such as `- 11`, is accepted only when the current Anime Tosho record confirms season 1, the exact same hash has one processed video, the requested episode matches, and the legacy metadata independently proves a non-forced Brazilian Portuguese subtitle. The returned Torznab title is then normalized to `S01E11`.
 
 Configuration:
 
 - `ANIME_BR_ANIMETOSHO_URL`: JSON feed base URL. Default: `https://feed.animetosho.xyz`.
+- `ANIME_BR_ANIMETOSHO_LEGACY_ENABLED`: enable historical metadata fallback. Default: `true`. Set it to `false` to disable every legacy lookup, including cached legacy responses.
+- `ANIME_BR_ANIMETOSHO_LEGACY_URL`: legacy JSON feed base URL. Default: `https://feed.animetosho.org`.
+- `ANIME_BR_ANIMETOSHO_LEGACY_TIMEOUT_SECONDS`: total per-search budget shared by all legacy lookups. Default: `20`. It is also capped to preserve the final five seconds of the overall search; when it expires, the search continues without legacy results.
 - `ANIME_BR_NYAA_ENABLED`: enable Nyaa.si RSS discovery. Default: `true`. Set it to `false` to use only Anime Tosho NEW.
 - `ANIME_BR_NYAA_URL`: Nyaa.si base URL, or the URL of a compatible mirror. Default: `https://nyaa.si`.
 - `ANIME_BR_NYAA_CACHE_SECONDS`: cache duration for each Nyaa RSS search. Default: `180` (3 minutes).
@@ -105,7 +111,7 @@ In Prowlarr, add a **Generic Torznab** indexer with:
 - API key: leave empty, or use any placeholder if the UI requires one
 - Categories: TV / Anime (`5070`)
 
-Anime Tosho NEW can take minutes to process a new Nyaa torrent. Until it has extracted and identified a Brazilian Portuguese track, strict searches intentionally return no result for that release.
+Anime Tosho NEW can take minutes to process a new Nyaa torrent. Until it has extracted and identified a Brazilian Portuguese track, strict searches intentionally return no result for that release. The legacy feed is not used for discovery and never makes a search fail; disabling it only removes historical releases that require its archived file and subtitle metadata.
 
 For a local Docker build instead of the published image:
 

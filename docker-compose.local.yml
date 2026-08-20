@@ -5,6 +5,9 @@ services:
     image: torrent-indexer:anime-br-local
     environment:
       - ANIME_BR_ANIMETOSHO_URL=https://feed.animetosho.xyz
+      - ANIME_BR_ANIMETOSHO_LEGACY_ENABLED=true
+      - ANIME_BR_ANIMETOSHO_LEGACY_URL=https://feed.animetosho.org
+      - ANIME_BR_ANIMETOSHO_LEGACY_TIMEOUT_SECONDS=20
       - ANIME_BR_NYAA_ENABLED=true
       - ANIME_BR_NYAA_URL=https://nyaa.si
       - ANIME_BR_NYAA_CACHE_SECONDS=180
