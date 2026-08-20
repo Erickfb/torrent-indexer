@@ -24,10 +24,12 @@ import (
 )
 
 const (
-	defaultAnimeToshoURL     = "https://feed.animetosho.xyz"
-	defaultAnimeBRMaxDetails = 48
-	defaultAnimeBRWorkers    = 4
-	maxAnimeBRResponseBytes  = 16 << 20
+	defaultAnimeToshoURL                   = "https://feed.animetosho.xyz"
+	defaultAnimeBRMaxDetails               = 48
+	defaultAnimeBRWorkers                  = 4
+	defaultAnimeBRUnverifiedDetailCacheTTL = 10 * time.Minute
+	maxAnimeBRResponseBytes                = 16 << 20
+	animeBRCacheVersion                    = "v2"
 )
 
 var (
@@ -45,14 +47,15 @@ type animeBRCache interface {
 }
 
 type AnimeBRConfig struct {
-	BaseURL        string
-	StrictFilename bool
-	MaxDetails     int
-	Workers        int
-	RequestTimeout time.Duration
-	SearchTimeout  time.Duration
-	SearchCacheTTL time.Duration
-	DetailCacheTTL time.Duration
+	BaseURL                  string
+	StrictFilename           bool
+	MaxDetails               int
+	Workers                  int
+	RequestTimeout           time.Duration
+	SearchTimeout            time.Duration
+	SearchCacheTTL           time.Duration
+	DetailCacheTTL           time.Duration
+	UnverifiedDetailCacheTTL time.Duration
 }
 
 type AnimeBRService struct {
@@ -175,14 +178,15 @@ type animeBREvidence struct {
 
 func NewAnimeBRService(redis *cache.Redis) *AnimeBRService {
 	config := AnimeBRConfig{
-		BaseURL:        envOrDefault("ANIME_BR_ANIMETOSHO_URL", defaultAnimeToshoURL),
-		StrictFilename: !strings.EqualFold(os.Getenv("ANIME_BR_STRICT_FILENAME"), "false"),
-		MaxDetails:     envIntOrDefault("ANIME_BR_MAX_DETAILS", defaultAnimeBRMaxDetails),
-		Workers:        envIntOrDefault("ANIME_BR_DETAIL_CONCURRENCY", defaultAnimeBRWorkers),
-		RequestTimeout: time.Duration(envIntOrDefault("ANIME_BR_TIMEOUT_SECONDS", 20)) * time.Second,
-		SearchTimeout:  time.Duration(envIntOrDefault("ANIME_BR_SEARCH_TIMEOUT_SECONDS", 45)) * time.Second,
-		SearchCacheTTL: 5 * time.Minute,
-		DetailCacheTTL: 7 * 24 * time.Hour,
+		BaseURL:                  envOrDefault("ANIME_BR_ANIMETOSHO_URL", defaultAnimeToshoURL),
+		StrictFilename:           !strings.EqualFold(os.Getenv("ANIME_BR_STRICT_FILENAME"), "false"),
+		MaxDetails:               envIntOrDefault("ANIME_BR_MAX_DETAILS", defaultAnimeBRMaxDetails),
+		Workers:                  envIntOrDefault("ANIME_BR_DETAIL_CONCURRENCY", defaultAnimeBRWorkers),
+		RequestTimeout:           time.Duration(envIntOrDefault("ANIME_BR_TIMEOUT_SECONDS", 20)) * time.Second,
+		SearchTimeout:            time.Duration(envIntOrDefault("ANIME_BR_SEARCH_TIMEOUT_SECONDS", 45)) * time.Second,
+		SearchCacheTTL:           5 * time.Minute,
+		DetailCacheTTL:           7 * 24 * time.Hour,
+		UnverifiedDetailCacheTTL: time.Duration(envIntOrDefault("ANIME_BR_UNVERIFIED_DETAIL_CACHE_SECONDS", int(defaultAnimeBRUnverifiedDetailCacheTTL/time.Second))) * time.Second,
 	}
 
 	return newAnimeBRService(config, redis, nil)
@@ -207,6 +211,9 @@ func newAnimeBRService(config AnimeBRConfig, c animeBRCache, client *http.Client
 	}
 	if config.DetailCacheTTL <= 0 {
 		config.DetailCacheTTL = 7 * 24 * time.Hour
+	}
+	if config.UnverifiedDetailCacheTTL <= 0 {
+		config.UnverifiedDetailCacheTTL = defaultAnimeBRUnverifiedDetailCacheTTL
 	}
 	if client == nil {
 		client = &http.Client{Timeout: config.RequestTimeout}
@@ -528,12 +535,39 @@ func (s *AnimeBRService) getJSON(ctx context.Context, rawURL string, ttl time.Du
 	if err := json.Unmarshal(body, destination); err != nil {
 		return err
 	}
+	cacheTTL := ttl
+	if detail, ok := destination.(*animeToshoDetail); ok {
+		cacheTTL = s.animeBRDetailCacheTTL(*detail)
+	}
 	if s.cache != nil {
-		if err := s.cache.SetWithExpiration(ctx, cacheKey, body, ttl); err != nil {
+		if err := s.cache.SetWithExpiration(ctx, cacheKey, body, cacheTTL); err != nil {
 			logging.Debug().Err(err).Msg("Failed to cache Anime BR response")
 		}
 	}
 	return nil
+}
+
+func (s *AnimeBRService) animeBRDetailCacheTTL(detail animeToshoDetail) time.Duration {
+	if animeBRDetailHasStablePTBRMetadata(detail) {
+		return s.config.DetailCacheTTL
+	}
+	return s.config.UnverifiedDetailCacheTTL
+}
+
+func animeBRDetailHasStablePTBRMetadata(detail animeToshoDetail) bool {
+	if !strings.EqualFold(detail.Status, "complete") || detail.Deleted {
+		return false
+	}
+
+	for _, file := range detail.Files {
+		if !file.Processed || !isVideoFileName(file.Filename) {
+			continue
+		}
+		if classifyPTBREvidence(detail, file).Verified {
+			return true
+		}
+	}
+	return false
 }
 
 func classifyPTBREvidence(detail animeToshoDetail, selectedFile animeToshoFile) animeBREvidence {
@@ -758,7 +792,7 @@ func validInfoHash(hash string) bool {
 
 func animeBRCacheKey(rawURL string) string {
 	hash := sha256.Sum256([]byte(rawURL))
-	return fmt.Sprintf("anime_br:http:%x", hash[:])
+	return fmt.Sprintf("anime_br:%s:http:%x", animeBRCacheVersion, hash[:])
 }
 
 func envOrDefault(name, fallback string) string {

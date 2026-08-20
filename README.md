@@ -88,6 +88,7 @@ Configuration:
 - `ANIME_BR_DETAIL_CONCURRENCY`: maximum concurrent detail requests. Default: `4`.
 - `ANIME_BR_TIMEOUT_SECONDS`: upstream HTTP timeout. Default: `20`.
 - `ANIME_BR_SEARCH_TIMEOUT_SECONDS`: maximum duration for the complete search. Default: `45`.
+- `ANIME_BR_UNVERIFIED_DETAIL_CACHE_SECONDS`: refresh interval for details that do not yet contain verified PT-BR subtitle metadata. Default: `600` (10 minutes). Verified details remain cached for 7 days.
 
 In Prowlarr, add a **Generic Torznab** indexer with:
 

@@ -202,6 +202,113 @@ func TestAnimeBRSearchReturnsOnlyVerifiedCompatibleRelease(t *testing.T) {
 	}
 }
 
+func TestAnimeBRDetailCacheTTLRefreshesUnverifiedMetadata(t *testing.T) {
+	const (
+		verifiedTTL   = 48 * time.Hour
+		unverifiedTTL = 3 * time.Minute
+	)
+	baseDetail := animeToshoDetail{
+		Status: "complete",
+		Files: []animeToshoFile{{
+			Filename:  "Example.Show.S02E07.1080p.WEB-DL.mkv",
+			Processed: true,
+		}},
+	}
+	verifiedDetail := baseDetail
+	verifiedDetail.Attachments = []animeToshoAttachment{{
+		Type: "subtitle",
+		Info: animeToshoAttachmentInfo{LanguageCode: "por", Language: "Portuguese[BR]"},
+	}}
+	forcedOnlyDetail := baseDetail
+	forcedOnlyDetail.Attachments = []animeToshoAttachment{{
+		Type: "subtitle",
+		Info: animeToshoAttachmentInfo{LanguageCode: "por", Language: "Portuguese[BR]", Forced: true},
+	}}
+	unprocessedDetail := verifiedDetail
+	unprocessedDetail.Files = append([]animeToshoFile(nil), verifiedDetail.Files...)
+	unprocessedDetail.Files[0].Processed = false
+
+	service := newAnimeBRService(AnimeBRConfig{
+		BaseURL:                  "https://example.invalid",
+		DetailCacheTTL:           verifiedTTL,
+		UnverifiedDetailCacheTTL: unverifiedTTL,
+	}, nil, nil)
+	tests := []struct {
+		name   string
+		detail animeToshoDetail
+		want   time.Duration
+	}{
+		{name: "verified and processed", detail: verifiedDetail, want: verifiedTTL},
+		{name: "metadata extraction not finished", detail: baseDetail, want: unverifiedTTL},
+		{name: "forced subtitle only", detail: forcedOnlyDetail, want: unverifiedTTL},
+		{name: "video not processed", detail: unprocessedDetail, want: unverifiedTTL},
+		{name: "upstream still pending", detail: animeToshoDetail{Status: "pending"}, want: unverifiedTTL},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := service.animeBRDetailCacheTTL(tt.detail); got != tt.want {
+				t.Fatalf("detail cache TTL = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnimeBRDetailResponseUsesAdaptiveCacheTTL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		detail := animeToshoDetail{
+			ID:     7,
+			Status: "complete",
+			Files: []animeToshoFile{{
+				Filename:  "Example.Show.S02E07.1080p.WEB-DL.mkv",
+				Processed: true,
+			}},
+		}
+		if r.URL.Query().Get("id") == "8" {
+			detail.ID = 8
+			detail.Attachments = []animeToshoAttachment{{
+				Type: "subtitle",
+				Info: animeToshoAttachmentInfo{LanguageCode: "por", Language: "Portuguese[BR]"},
+			}}
+		}
+		_ = json.NewEncoder(w).Encode(detail)
+	}))
+	defer server.Close()
+
+	const (
+		verifiedTTL   = 48 * time.Hour
+		unverifiedTTL = 3 * time.Minute
+	)
+	for _, tt := range []struct {
+		id   int64
+		want time.Duration
+	}{
+		{id: 7, want: unverifiedTTL},
+		{id: 8, want: verifiedTTL},
+	} {
+		cache := &recordingAnimeBRCache{}
+		service := newAnimeBRService(AnimeBRConfig{
+			BaseURL:                  server.URL,
+			DetailCacheTTL:           verifiedTTL,
+			UnverifiedDetailCacheTTL: unverifiedTTL,
+		}, cache, server.Client())
+		if _, err := service.getAnimeToshoDetail(context.Background(), tt.id); err != nil {
+			t.Fatalf("getAnimeToshoDetail(%d) error = %v", tt.id, err)
+		}
+		if cache.ttl != tt.want {
+			t.Fatalf("detail %d cached for %v, want %v", tt.id, cache.ttl, tt.want)
+		}
+	}
+}
+
+func TestAnimeBRCacheKeyHasVersionedNamespace(t *testing.T) {
+	key := animeBRCacheKey("https://feed.animetosho.xyz/json?show=torrent&id=630216")
+	if !strings.HasPrefix(key, "anime_br:v2:http:") {
+		t.Fatalf("cache key %q does not invalidate the previous namespace", key)
+	}
+}
+
 func TestAnimeBRLiveMushokuS03E07(t *testing.T) {
 	if os.Getenv("ANIME_BR_LIVE_TEST") != "1" {
 		t.Skip("set ANIME_BR_LIVE_TEST=1 to query Anime Tosho NEW")
@@ -298,6 +405,45 @@ func TestAnimeBRLiveOnePieceS01E1173(t *testing.T) {
 	}
 }
 
+func TestAnimeBRLiveGaikotsuS02E07(t *testing.T) {
+	if os.Getenv("ANIME_BR_LIVE_TEST") != "1" {
+		t.Skip("set ANIME_BR_LIVE_TEST=1 to query Anime Tosho NEW")
+	}
+	service := newAnimeBRService(AnimeBRConfig{
+		BaseURL:        defaultAnimeToshoURL,
+		StrictFilename: true,
+		MaxDetails:     defaultAnimeBRMaxDetails,
+		Workers:        4,
+		RequestTimeout: 30 * time.Second,
+		SearchTimeout:  45 * time.Second,
+	}, nil, nil)
+
+	releases, err := service.Search(context.Background(), AnimeBRSearchRequest{
+		Query:  "Gaikotsu Kishi sama Tadaima Isekai e Odekake chuu II",
+		Season: 2, Episode: 7, TVDBID: 401279,
+	})
+	if err != nil {
+		t.Fatalf("live Search() error = %v", err)
+	}
+	if len(releases) == 0 {
+		t.Fatal("live Search() returned no verified S02E07 releases")
+	}
+	foundPreferredH264 := false
+	for _, release := range releases {
+		t.Logf("verified Gaikotsu release: %s | %v", release.Title, release.Evidence)
+		upperTitle := strings.ToUpper(release.Title)
+		if !strings.Contains(upperTitle, "S02E07") {
+			t.Errorf("incompatible live release escaped strict mode: %q", release.Title)
+		}
+		if strings.Contains(upperTitle, "VARYG") || strings.Contains(upperTitle, "TOONSHUB") || strings.Contains(upperTitle, "ANOZU") {
+			foundPreferredH264 = true
+		}
+	}
+	if !foundPreferredH264 {
+		t.Errorf("verified releases did not include the known VARYG, ToonsHub, or AnoZu H.264 options")
+	}
+}
+
 func TestAnimeBRLiveEmptySearchForProwlarrConnection(t *testing.T) {
 	if os.Getenv("ANIME_BR_LIVE_TEST") != "1" {
 		t.Skip("set ANIME_BR_LIVE_TEST=1 to query Anime Tosho NEW")
@@ -378,4 +524,19 @@ func newAnimeBRFixtureServer(t *testing.T) *httptest.Server {
 		_ = json.NewEncoder(w).Encode(detail)
 	}))
 	return server
+}
+
+type recordingAnimeBRCache struct {
+	key string
+	ttl time.Duration
+}
+
+func (c *recordingAnimeBRCache) Get(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (c *recordingAnimeBRCache) SetWithExpiration(_ context.Context, key string, _ []byte, ttl time.Duration) error {
+	c.key = key
+	c.ttl = ttl
+	return nil
 }
