@@ -25,9 +25,13 @@ import (
 
 const (
 	defaultAnimeToshoURL                   = "https://feed.animetosho.xyz"
+	defaultNyaaURL                         = "https://nyaa.si"
 	defaultAnimeBRMaxDetails               = 48
 	defaultAnimeBRWorkers                  = 4
 	defaultAnimeBRUnverifiedDetailCacheTTL = 10 * time.Minute
+	defaultNyaaSearchCacheTTL              = 3 * time.Minute
+	defaultNyaaRequestDelay                = 5 * time.Second
+	defaultNyaaDiscoveryTimeout            = 25 * time.Second
 	maxAnimeBRResponseBytes                = 16 << 20
 	animeBRCacheVersion                    = "v2"
 )
@@ -48,6 +52,11 @@ type animeBRCache interface {
 
 type AnimeBRConfig struct {
 	BaseURL                  string
+	NyaaURL                  string
+	NyaaEnabled              bool
+	NyaaSearchCacheTTL       time.Duration
+	NyaaRequestDelay         time.Duration
+	NyaaDiscoveryTimeout     time.Duration
 	StrictFilename           bool
 	MaxDetails               int
 	Workers                  int
@@ -59,9 +68,11 @@ type AnimeBRConfig struct {
 }
 
 type AnimeBRService struct {
-	config AnimeBRConfig
-	cache  animeBRCache
-	client *http.Client
+	config          AnimeBRConfig
+	cache           animeBRCache
+	client          *http.Client
+	nyaaRequestGate chan struct{}
+	nyaaLastRequest time.Time
 }
 
 type AnimeBRSearchRequest struct {
@@ -109,6 +120,8 @@ type animeToshoSearchItem struct {
 	Leechers               int    `json:"leechers"`
 	TotalSize              int64  `json:"total_size"`
 	TorrentDownloadedCount int    `json:"torrent_downloaded_count"`
+	Source                 string `json:"-"`
+	NyaaID                 int64  `json:"-"`
 }
 
 type animeToshoDetail struct {
@@ -179,6 +192,11 @@ type animeBREvidence struct {
 func NewAnimeBRService(redis *cache.Redis) *AnimeBRService {
 	config := AnimeBRConfig{
 		BaseURL:                  envOrDefault("ANIME_BR_ANIMETOSHO_URL", defaultAnimeToshoURL),
+		NyaaURL:                  envOrDefault("ANIME_BR_NYAA_URL", defaultNyaaURL),
+		NyaaEnabled:              !strings.EqualFold(os.Getenv("ANIME_BR_NYAA_ENABLED"), "false"),
+		NyaaSearchCacheTTL:       time.Duration(envIntOrDefault("ANIME_BR_NYAA_CACHE_SECONDS", int(defaultNyaaSearchCacheTTL/time.Second))) * time.Second,
+		NyaaRequestDelay:         time.Duration(envIntOrDefault("ANIME_BR_NYAA_REQUEST_DELAY_SECONDS", int(defaultNyaaRequestDelay/time.Second))) * time.Second,
+		NyaaDiscoveryTimeout:     time.Duration(envIntOrDefault("ANIME_BR_NYAA_TIMEOUT_SECONDS", int(defaultNyaaDiscoveryTimeout/time.Second))) * time.Second,
 		StrictFilename:           !strings.EqualFold(os.Getenv("ANIME_BR_STRICT_FILENAME"), "false"),
 		MaxDetails:               envIntOrDefault("ANIME_BR_MAX_DETAILS", defaultAnimeBRMaxDetails),
 		Workers:                  envIntOrDefault("ANIME_BR_DETAIL_CONCURRENCY", defaultAnimeBRWorkers),
@@ -194,6 +212,7 @@ func NewAnimeBRService(redis *cache.Redis) *AnimeBRService {
 
 func newAnimeBRService(config AnimeBRConfig, c animeBRCache, client *http.Client) *AnimeBRService {
 	config.BaseURL = strings.TrimRight(config.BaseURL, "/")
+	config.NyaaURL = strings.TrimRight(config.NyaaURL, "/")
 	if config.MaxDetails <= 0 {
 		config.MaxDetails = defaultAnimeBRMaxDetails
 	}
@@ -215,17 +234,36 @@ func newAnimeBRService(config AnimeBRConfig, c animeBRCache, client *http.Client
 	if config.UnverifiedDetailCacheTTL <= 0 {
 		config.UnverifiedDetailCacheTTL = defaultAnimeBRUnverifiedDetailCacheTTL
 	}
+	if config.NyaaEnabled {
+		if config.NyaaURL == "" {
+			config.NyaaURL = defaultNyaaURL
+		}
+		if config.NyaaSearchCacheTTL <= 0 {
+			config.NyaaSearchCacheTTL = defaultNyaaSearchCacheTTL
+		}
+		if config.NyaaRequestDelay <= 0 {
+			config.NyaaRequestDelay = defaultNyaaRequestDelay
+		}
+		if config.NyaaDiscoveryTimeout <= 0 {
+			config.NyaaDiscoveryTimeout = defaultNyaaDiscoveryTimeout
+		}
+	}
 	if client == nil {
 		client = &http.Client{Timeout: config.RequestTimeout}
 	}
-	return &AnimeBRService{config: config, cache: c, client: client}
+	return &AnimeBRService{
+		config:          config,
+		cache:           c,
+		client:          client,
+		nyaaRequestGate: make(chan struct{}, 1),
+	}
 }
 
 func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchRequest) ([]AnimeBRRelease, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.config.SearchTimeout)
 	defer cancel()
 
-	items, err := s.searchAnimeToshoForRequest(ctx, request)
+	items, err := s.discoverAnimeBRItems(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +304,7 @@ func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchReques
 		go func() {
 			defer wg.Done()
 			for item := range jobs {
-				detail, detailErr := s.getAnimeToshoDetail(ctx, item.ID)
+				detail, detailErr := s.getAnimeToshoDetailForCandidate(ctx, item)
 				if detailErr != nil {
 					results <- detailResult{err: detailErr}
 					continue
@@ -331,6 +369,71 @@ func (s *AnimeBRService) Search(ctx context.Context, request AnimeBRSearchReques
 	return releases, nil
 }
 
+func (s *AnimeBRService) discoverAnimeBRItems(ctx context.Context, request AnimeBRSearchRequest) ([]animeToshoSearchItem, error) {
+	type sourceResult struct {
+		name  string
+		items []animeToshoSearchItem
+		err   error
+	}
+
+	sourceCount := 1
+	nyaaCtx := ctx
+	cancelNyaa := func() {}
+	if s.config.NyaaEnabled {
+		sourceCount++
+		nyaaCtx, cancelNyaa = context.WithTimeout(ctx, s.config.NyaaDiscoveryTimeout)
+	}
+	defer cancelNyaa()
+	results := make(chan sourceResult, sourceCount)
+	go func() {
+		items, err := s.searchAnimeToshoForRequest(ctx, request)
+		results <- sourceResult{name: "Anime Tosho NEW", items: items, err: err}
+	}()
+	if s.config.NyaaEnabled {
+		go func() {
+			items, err := s.searchNyaaForRequest(nyaaCtx, request)
+			results <- sourceResult{name: "Nyaa.si", items: items, err: err}
+		}()
+	}
+
+	var animeToshoItems, nyaaItems []animeToshoSearchItem
+	var sourceErrors []error
+	successfulSources := 0
+	nyaaDiscoverySucceeded := false
+	for range sourceCount {
+		result := <-results
+		if result.err != nil {
+			sourceErrors = append(sourceErrors, fmt.Errorf("%s discovery failed: %w", result.name, result.err))
+			continue
+		}
+		successfulSources++
+		if result.name == "Nyaa.si" {
+			nyaaItems = result.items
+			nyaaDiscoverySucceeded = true
+		} else {
+			animeToshoItems = result.items
+		}
+	}
+
+	if successfulSources == 0 {
+		return nil, errors.Join(sourceErrors...)
+	}
+	if len(sourceErrors) > 0 {
+		logging.Debug().Err(errors.Join(sourceErrors...)).Msg("Some Anime BR discovery sources failed")
+	}
+	if s.config.NyaaEnabled && nyaaDiscoverySucceeded && nyaaCtx.Err() == nil {
+		if aliasQuery := deriveNyaaAliasQuery(animeToshoItems, request); aliasQuery != "" {
+			aliasItems, aliasErr := s.searchNyaa(nyaaCtx, aliasQuery)
+			if aliasErr != nil {
+				logging.Debug().Err(aliasErr).Str("query", aliasQuery).Msg("Nyaa alias discovery failed")
+			} else {
+				nyaaItems = mergeNyaaSearchItems(nyaaItems, convertNyaaRSSItems(aliasItems))
+			}
+		}
+	}
+	return mergeAnimeBRSearchItems(animeToshoItems, nyaaItems), nil
+}
+
 func (s *AnimeBRService) searchAnimeToshoForRequest(ctx context.Context, request AnimeBRSearchRequest) ([]animeToshoSearchItem, error) {
 	queries := animeBRSearchQueries(request)
 	itemsByKey := make(map[string]animeToshoSearchItem)
@@ -385,6 +488,13 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 	if detail.Deleted || detail.IsDupe || detail.IsBatch || !strings.EqualFold(detail.Status, "complete") {
 		return AnimeBRRelease{}, false
 	}
+	itemHash := strings.ToLower(strings.TrimSpace(item.InfoHash))
+	detailHash := strings.ToLower(strings.TrimSpace(detail.InfoHash))
+	if !validInfoHash(itemHash) || !validInfoHash(detailHash) || itemHash != detailHash {
+		// Nyaa is only a discovery source. The exact torrent being returned must
+		// be the same torrent whose files and subtitle tracks Anime Tosho parsed.
+		return AnimeBRRelease{}, false
+	}
 	if request.TVDBID > 0 && detail.TVDBID > 0 && request.TVDBID != detail.TVDBID {
 		return AnimeBRRelease{}, false
 	}
@@ -413,13 +523,24 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 	}
 
 	downloadURL := firstNonEmpty(detail.TorrentURL, item.TorrentURL, detail.MagnetURI, item.MagnetURI)
+	detailsURL := firstNonEmpty(detail.Link, item.Link, fmt.Sprintf("https://animetosho.xyz/view/%d", detail.ID))
+	source := firstNonEmpty(item.Source, "Anime Tosho NEW")
+	if strings.Contains(source, "Nyaa.si") {
+		// Nyaa provides the freshest swarm counts and the original .torrent URL,
+		// while Anime Tosho independently verifies the file and subtitle tracks.
+		downloadURL = firstNonEmpty(item.TorrentURL, detail.TorrentURL, item.MagnetURI, detail.MagnetURI)
+		nyaaDetailsFallback := ""
+		if item.NyaaID > 0 {
+			nyaaDetailsFallback = fmt.Sprintf("https://nyaa.si/view/%d", item.NyaaID)
+		}
+		detailsURL = firstNonEmpty(item.Link, detail.Link, nyaaDetailsFallback)
+		source = "Nyaa.si + Anime Tosho NEW"
+		evidence.Reasons = append(evidence.Reasons, "Nyaa.si candidate matched Anime Tosho metadata by exact infohash")
+	}
 	if downloadURL == "" {
 		return AnimeBRRelease{}, false
 	}
-	infoHash := strings.ToLower(firstNonEmpty(detail.InfoHash, item.InfoHash))
-	if !validInfoHash(infoHash) {
-		return AnimeBRRelease{}, false
-	}
+	infoHash := detailHash
 
 	season, episode := request.Season, request.Episode
 	if season == 0 || episode == 0 {
@@ -446,7 +567,7 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 		ID:                firstNonZeroInt64(detail.ID, item.ID),
 		Title:             title,
 		OriginalTitle:     originalTitle,
-		Details:           firstNonEmpty(detail.Link, item.Link, fmt.Sprintf("https://animetosho.xyz/view/%d", item.ID)),
+		Details:           detailsURL,
 		DownloadURL:       downloadURL,
 		MagnetURL:         firstNonEmpty(detail.MagnetURI, item.MagnetURI),
 		InfoHash:          infoHash,
@@ -457,7 +578,7 @@ func (s *AnimeBRService) buildVerifiedRelease(item animeToshoSearchItem, detail 
 		Season:            season,
 		Episode:           episode,
 		TVDBID:            detail.TVDBID,
-		Source:            "Anime Tosho NEW",
+		Source:            source,
 		PTBRState:         "verified",
 		SubtitleLanguages: []string{"Portuguese (Brazil)"},
 		Evidence:          slices.Compact(evidence.Reasons),
@@ -501,6 +622,52 @@ func (s *AnimeBRService) getAnimeToshoDetail(ctx context.Context, id int64) (ani
 	return detail, nil
 }
 
+func (s *AnimeBRService) getAnimeToshoDetailForCandidate(ctx context.Context, item animeToshoSearchItem) (animeToshoDetail, error) {
+	if item.ID > 0 {
+		return s.getAnimeToshoDetail(ctx, item.ID)
+	}
+	if !validInfoHash(item.InfoHash) {
+		return animeToshoDetail{}, fmt.Errorf("candidate has no valid Anime Tosho id or infohash")
+	}
+	return s.getAnimeToshoDetailByHash(ctx, item.InfoHash)
+}
+
+func (s *AnimeBRService) getAnimeToshoDetailByHash(ctx context.Context, infoHash string) (animeToshoDetail, error) {
+	endpoint, err := url.Parse(s.config.BaseURL + "/json")
+	if err != nil {
+		return animeToshoDetail{}, err
+	}
+	values := endpoint.Query()
+	values.Set("show", "torrent")
+	values.Set("btih", strings.ToLower(infoHash))
+	endpoint.RawQuery = values.Encode()
+
+	var detail animeToshoDetail
+	if err := s.getJSON(ctx, endpoint.String(), s.config.DetailCacheTTL, &detail); err != nil {
+		var statusErr *animeBRHTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+			// A freshly published Nyaa torrent may not have been processed yet.
+			// Cache the negative lookup briefly so repeated Sonarr searches do not
+			// hammer the upstream service; it will be retried after the short TTL.
+			if s.cache != nil {
+				body, _ := json.Marshal(animeToshoDetail{})
+				_ = s.cache.SetWithExpiration(ctx, animeBRCacheKey(endpoint.String()), body, s.config.UnverifiedDetailCacheTTL)
+			}
+			return animeToshoDetail{}, nil
+		}
+		return animeToshoDetail{}, fmt.Errorf("Anime Tosho detail for %s failed: %w", infoHash, err)
+	}
+	return detail, nil
+}
+
+type animeBRHTTPStatusError struct {
+	StatusCode int
+}
+
+func (e *animeBRHTTPStatusError) Error() string {
+	return fmt.Sprintf("unexpected HTTP status %d", e.StatusCode)
+}
+
 func (s *AnimeBRService) getJSON(ctx context.Context, rawURL string, ttl time.Duration, destination any) error {
 	cacheKey := animeBRCacheKey(rawURL)
 	if s.cache != nil {
@@ -523,7 +690,7 @@ func (s *AnimeBRService) getJSON(ctx context.Context, rawURL string, ttl time.Du
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+		return &animeBRHTTPStatusError{StatusCode: resp.StatusCode}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAnimeBRResponseBytes+1))
 	if err != nil {

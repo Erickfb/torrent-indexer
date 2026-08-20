@@ -14,6 +14,13 @@ services:
       - REDIS_HOST=redis
       - FLARESOLVERR_ADDRESS=http://flaresolverr:8191
 
+      ## Anime BR verified discovery
+      - ANIME_BR_NYAA_ENABLED=true
+      - ANIME_BR_NYAA_URL=https://nyaa.si
+      - ANIME_BR_NYAA_CACHE_SECONDS=180
+      - ANIME_BR_NYAA_REQUEST_DELAY_SECONDS=5
+      - ANIME_BR_NYAA_TIMEOUT_SECONDS=25
+
       ## Meilisearch configuration (optional)
       # - MEILISEARCH_ADDRESS=http://meilisearch:7700
       # - MEILISEARCH_KEY=my-secret-key

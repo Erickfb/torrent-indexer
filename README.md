@@ -18,7 +18,8 @@ Visit [https://torrent-indexer.darklyn.org/](https://torrent-indexer.darklyn.org
 - [rede-torrent](https://redetorrent.com/)
 - [vaca-torrent](https://vaqueirofilmes.com/)
 - [erai-raws](https://www.erai-raws.info/)
-- [Anime Tosho NEW](https://animetosho.xyz/) (verified Brazilian Portuguese anime subtitles)
+- [Nyaa.si](https://nyaa.si/) (anime torrent discovery)
+- [Anime Tosho NEW](https://animetosho.xyz/) (Brazilian Portuguese subtitle verification)
 
 ## Deploy
 
@@ -76,13 +77,20 @@ You can configure the server using the following environment variables:
 
 ### Anime BR Verified (native Torznab)
 
-The service exposes a native Torznab endpoint at `/api` for anime releases whose Brazilian Portuguese subtitle tracks were independently extracted by Anime Tosho NEW. `[MultiSub]` by itself is never accepted.
+The service exposes a native Torznab endpoint at `/api`. It discovers anime candidates concurrently through Anime Tosho NEW and the Nyaa.si RSS feed, merges them by BitTorrent info hash, and only returns releases whose Brazilian Portuguese subtitle tracks were independently extracted by Anime Tosho NEW. `[MultiSub]` by itself is never accepted.
+
+Nyaa.si is a discovery source, not the source of PT-BR proof. A torrent found only on Nyaa is looked up by its exact info hash in Anime Tosho NEW. If it has not been processed there yet, it is intentionally withheld and retried after the short unverified-result cache expires.
 
 Strict mode also checks the actual video filename reported by the torrent processor. A Sonarr search for season 2 episode 10 accepts `S02E10`, but rejects ambiguous payloads such as `S2 - 10`; this prevents the release title and downloaded filename from resolving to different seasons.
 
 Configuration:
 
 - `ANIME_BR_ANIMETOSHO_URL`: JSON feed base URL. Default: `https://feed.animetosho.xyz`.
+- `ANIME_BR_NYAA_ENABLED`: enable Nyaa.si RSS discovery. Default: `true`. Set it to `false` to use only Anime Tosho NEW.
+- `ANIME_BR_NYAA_URL`: Nyaa.si base URL, or the URL of a compatible mirror. Default: `https://nyaa.si`.
+- `ANIME_BR_NYAA_CACHE_SECONDS`: cache duration for each Nyaa RSS search. Default: `180` (3 minutes).
+- `ANIME_BR_NYAA_REQUEST_DELAY_SECONDS`: minimum interval between Nyaa requests made by this process. Default: `5`. Keep it at 5 seconds or longer to respect the site's crawl delay.
+- `ANIME_BR_NYAA_TIMEOUT_SECONDS`: total budget for Nyaa discovery, including query variants and rate-limit waits. Default: `25`. When it expires, the request continues with Anime Tosho NEW results.
 - `ANIME_BR_STRICT_FILENAME`: require an actual `SxxEyy` marker in the video filename. Default: `true`; disabling it is not recommended for Sonarr.
 - `ANIME_BR_MAX_DETAILS`: maximum candidate details enriched per search. Default: `48`.
 - `ANIME_BR_DETAIL_CONCURRENCY`: maximum concurrent detail requests. Default: `4`.
@@ -97,7 +105,7 @@ In Prowlarr, add a **Generic Torznab** indexer with:
 - API key: leave empty, or use any placeholder if the UI requires one
 - Categories: TV / Anime (`5070`)
 
-The upstream service can take minutes to process a new torrent. Until it has extracted and identified a Brazilian Portuguese track, strict searches intentionally return no result for that release.
+Anime Tosho NEW can take minutes to process a new Nyaa torrent. Until it has extracted and identified a Brazilian Portuguese track, strict searches intentionally return no result for that release.
 
 For a local Docker build instead of the published image:
 

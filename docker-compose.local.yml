@@ -5,6 +5,11 @@ services:
     image: torrent-indexer:anime-br-local
     environment:
       - ANIME_BR_ANIMETOSHO_URL=https://feed.animetosho.xyz
+      - ANIME_BR_NYAA_ENABLED=true
+      - ANIME_BR_NYAA_URL=https://nyaa.si
+      - ANIME_BR_NYAA_CACHE_SECONDS=180
+      - ANIME_BR_NYAA_REQUEST_DELAY_SECONDS=5
+      - ANIME_BR_NYAA_TIMEOUT_SECONDS=25
       - ANIME_BR_STRICT_FILENAME=true
       - ANIME_BR_MAX_DETAILS=48
       - ANIME_BR_DETAIL_CONCURRENCY=4
