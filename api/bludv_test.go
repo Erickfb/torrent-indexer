@@ -107,8 +107,8 @@ func TestFilterBluDVSeasonResultsReturnsEmptyWhenSeasonDoesNotMatch(t *testing.T
 }
 
 func TestBuildBluDVURLUsesSearchPagination(t *testing.T) {
-	got := buildBluDVURL(IndexerMeta{URL: "https://bludv2.xyz/", SearchURL: "?s="}, "rick and morty temporada 1", "2")
-	want := "https://bludv2.xyz/page/2/?s=rick+and+morty+temporada+1"
+	got := buildBluDVURL(IndexerMeta{URL: "https://bludvfilmes1.xyz/", SearchURL: "?s="}, "rick and morty temporada 1", "2")
+	want := "https://bludvfilmes1.xyz/page/2/?s=rick+and+morty+temporada+1"
 
 	if got != want {
 		t.Fatalf("buildBluDVURL() = %q, want %q", got, want)
@@ -117,9 +117,9 @@ func TestBuildBluDVURLUsesSearchPagination(t *testing.T) {
 
 func TestFilterBluDVSearchLinksKeepsRequestedTitleAndSeason(t *testing.T) {
 	links := []bludvSearchLink{
-		{URL: "https://bludv2.xyz/rick-e-morty-o-anime-1a-temporada/", Title: "Rick e Morty: O Anime 1a Temporada"},
-		{URL: "https://bludv2.xyz/rick-and-morty-7a-temporada/", Title: "Rick and Morty 7a Temporada"},
-		{URL: "https://bludv2.xyz/rick-and-morty-1a-temporada/", Title: "Rick and Morty 1a Temporada"},
+		{URL: "https://bludvfilmes1.xyz/rick-e-morty-o-anime-1a-temporada/", Title: "Rick e Morty: O Anime 1a Temporada"},
+		{URL: "https://bludvfilmes1.xyz/rick-and-morty-7a-temporada/", Title: "Rick and Morty 7a Temporada"},
+		{URL: "https://bludvfilmes1.xyz/rick-and-morty-1a-temporada/", Title: "Rick and Morty 1a Temporada"},
 	}
 
 	got := filterBluDVSearchLinks("rick e morty s01e01", "1", links)
@@ -127,7 +127,7 @@ func TestFilterBluDVSearchLinksKeepsRequestedTitleAndSeason(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d links, want 1", len(got))
 	}
-	if got[0].URL != "https://bludv2.xyz/rick-and-morty-1a-temporada/" {
+	if got[0].URL != "https://bludvfilmes1.xyz/rick-and-morty-1a-temporada/" {
 		t.Fatalf("URL = %q", got[0].URL)
 	}
 }

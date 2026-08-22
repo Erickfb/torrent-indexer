@@ -19,7 +19,7 @@ const (
 	cacheKey = "shortLivedCache"
 )
 
-var challangeRegex = regexp.MustCompile(`(?i)(just a moment|cf-chl-bypass|under attack|cf-mitigated|challenge-platform)`)
+var challangeRegex = regexp.MustCompile(`(?i)(just a moment|cf-chl-bypass|under attack|cf-mitigated)`)
 
 type Requster struct {
 	fs                        *FlareSolverr
