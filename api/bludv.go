@@ -307,7 +307,11 @@ func filterBluDVSeasonResults(q string, torrents []schema.IndexedTorrent) []sche
 	for _, it := range torrents {
 		title := fmt.Sprintf("%s %s", it.Title, it.OriginalTitle)
 		season := extractBluDVSeason(fmt.Sprintf("%s %s", title, it.Details))
-		if season == requestedSeason && matchesBluDVRequestedTitle(q, title) {
+		titleForMatch := strings.TrimSpace(it.OriginalTitle)
+		if titleForMatch == "" {
+			titleForMatch = it.Title
+		}
+		if season == requestedSeason && matchesBluDVRequestedTitle(q, titleForMatch) {
 			filtered = append(filtered, it)
 		}
 	}

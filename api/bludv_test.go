@@ -93,6 +93,21 @@ func TestFilterBluDVSeasonResultsRejectsSpinOffTitle(t *testing.T) {
 	}
 }
 
+func TestFilterBluDVSeasonResultsUsesPostTitleWhenMagnetNameContainsYear(t *testing.T) {
+	torrents := []schema.IndexedTorrent{
+		{
+			Title:         "Rick and Morty 2016 - 1a Temporada Completa (1080p)",
+			OriginalTitle: "Rick and Morty S01 1a Temporada Torrent - BluRay 1080p",
+		},
+	}
+
+	got := filterBluDVSeasonResults("rick and morty temporada 1", torrents)
+
+	if len(got) != 1 {
+		t.Fatalf("got %d torrents, want 1", len(got))
+	}
+}
+
 func TestFilterBluDVSeasonResultsReturnsEmptyWhenSeasonDoesNotMatch(t *testing.T) {
 	torrents := []schema.IndexedTorrent{
 		{OriginalTitle: "Rick and Morty 7a Temporada Torrent"},
